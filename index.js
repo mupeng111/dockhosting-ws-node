@@ -71,11 +71,22 @@ async function main() {
     process.exit(1);
   }
   await ensureAgent();
-  const args = ['-s', server, '-p', secret];
-  if (useTls) args.push('--tls');
-  args.push('--disable-auto-update');
+  // nezha-agent v2 uses a YAML config file (no -s/-p flags)
+  const crypto = require('crypto');
+  const uuid = crypto.randomUUID();
+  const cfg = [
+    `client_secret: ${secret}`,
+    `server: ${server}`,
+    `tls: ${useTls}`,
+    `uuid: ${uuid}`,
+    `debug: false`,
+    `disable_auto_update: true`,
+    `report_delay: 3`,
+  ].join('\n') + '\n';
+  const cfgPath = path.join(BIN_DIR, 'config.yml');
+  fs.writeFileSync(cfgPath, cfg);
   console.log(`[nezha] starting agent -> ${server} (tls=${useTls})`);
-  const child = spawn(AGENT_BIN, args, { stdio: 'inherit' });
+  const child = spawn(AGENT_BIN, ['-c', cfgPath], { stdio: 'inherit' });
   child.on('exit', (code) => {
     console.log(`[nezha] agent exited (${code}), restarting in 10s...`);
     setTimeout(main, 10000);
