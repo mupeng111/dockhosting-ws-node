@@ -1,131 +1,68 @@
-// Minimal VLESS over WebSocket server (Node.js built-ins only).
-// Env: UUID (required), WS_PATH (default /ws), PORT (default 8080)
-const http = require('http');
-const net = require('net');
-const crypto = require('crypto');
+// Nezha probe launcher: downloads nezha-agent and runs it.
+// Env: NZ_SERVER (host:port), NZ_CLIENT_SECRET, NZ_TLS (true/false)
+const { spawn, execSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
 
-const UUID_STR = process.env.UUID || '';
-const WS_PATH = process.env.WS_PATH || '/ws';
-const PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '8080', 10);
-const uuidBytes = Buffer.from(UUID_STR.replace(/-/g, ''), 'hex');
+const BIN_DIR = path.join(__dirname, 'bin');
+const AGENT_BIN = path.join(BIN_DIR, 'nezha-agent');
+const DOWNLOAD_URL = 'https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_amd64.zip';
 
-function wsAccept(key) {
-  return crypto.createHash('sha1')
-    .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
-    .digest('base64');
+function download(url, dest) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return download(res.headers.location, dest).then(resolve, reject);
+      }
+      if (res.statusCode !== 200) return reject(new Error('HTTP ' + res.statusCode));
+      const f = fs.createWriteStream(dest);
+      res.pipe(f);
+      f.on('finish', () => f.close(resolve));
+      f.on('error', reject);
+    }).on('error', reject);
+  });
 }
 
-function encodeFrame(data) {
-  const len = data.length;
-  let head;
-  if (len < 126) { head = Buffer.from([0x82, len]); }
-  else if (len < 65536) { head = Buffer.alloc(4); head[0] = 0x82; head[1] = 126; head.writeUInt16BE(len, 2); }
-  else { head = Buffer.alloc(10); head[0] = 0x82; head[1] = 127; head.writeBigUInt64BE(BigInt(len), 2); }
-  return Buffer.concat([head, data]);
+async function ensureAgent() {
+  if (fs.existsSync(AGENT_BIN)) return;
+  console.log('[nezha] downloading agent...');
+  fs.mkdirSync(BIN_DIR, { recursive: true });
+  const zipPath = path.join(BIN_DIR, 'agent.zip');
+  await download(DOWNLOAD_URL, zipPath);
+  execSync(`cd "${BIN_DIR}" && unzip -o agent.zip && chmod +x nezha-agent`, { stdio: 'inherit' });
+  fs.unlinkSync(zipPath);
+  console.log('[nezha] agent ready');
 }
 
-// Incremental WebSocket frame parser. Calls onMessage(fullPayload) for
-// reassembled binary/text messages, onPing(payload).
-class FrameParser {
-  constructor(onMessage, onPing, onClose) {
-    this.buf = Buffer.alloc(0);
-    this.frags = [];
-    this.onMessage = onMessage; this.onPing = onPing; this.onClose = onClose;
+async function main() {
+  const server = process.env.NZ_SERVER;
+  const secret = process.env.NZ_CLIENT_SECRET;
+  const useTls = String(process.env.NZ_TLS).toLowerCase() === 'true';
+  if (!server || !secret) {
+    console.error('[nezha] missing NZ_SERVER or NZ_CLIENT_SECRET');
+    process.exit(1);
   }
-  push(chunk) {
-    this.buf = Buffer.concat([this.buf, chunk]);
-    for (;;) {
-      if (this.buf.length < 2) return;
-      const b0 = this.buf[0], b1 = this.buf[1];
-      const fin = (b0 & 0x80) !== 0, op = b0 & 0x0f;
-      const masked = (b1 & 0x80) !== 0;
-      let len = b1 & 0x7f, off = 2;
-      if (len === 126) { if (this.buf.length < 4) return; len = this.buf.readUInt16BE(2); off = 4; }
-      else if (len === 127) { if (this.buf.length < 10) return; len = Number(this.buf.readBigUInt64BE(2)); off = 10; }
-      const maskOff = off; if (masked) off += 4;
-      if (this.buf.length < off + len) return;
-      let payload = Buffer.from(this.buf.subarray(off, off + len));
-      if (masked) { const m = this.buf.subarray(maskOff, maskOff + 4); for (let i = 0; i < payload.length; i++) payload[i] ^= m[i % 4]; }
-      this.buf = this.buf.subarray(off + len);
-      if (op === 0x8) { this.onClose(); return; }
-      if (op === 0x9) { this.onPing(payload); continue; }
-      if (op === 0xA) continue;
-      this.frags.push(payload);
-      if (fin) { this.onMessage(Buffer.concat(this.frags)); this.frags = []; }
-    }
-  }
+  await ensureAgent();
+  const args = ['-s', server, '-p', secret];
+  if (useTls) args.push('--tls');
+  args.push('--disable-auto-update');
+  console.log(`[nezha] starting agent -> ${server} (tls=${useTls})`);
+  const child = spawn(AGENT_BIN, args, { stdio: 'inherit' });
+  child.on('exit', (code) => {
+    console.log(`[nezha] agent exited (${code}), restarting in 10s...`);
+    setTimeout(main, 10000);
+  });
+  child.on('error', (e) => {
+    console.error('[nezha] spawn error:', e.message);
+    setTimeout(main, 10000);
+  });
 }
 
-function parseVlessHeader(msg) {
-  // Returns { host, port, offset } or null.
-  if (msg.length < 24) return null;
-  if (msg[0] !== 0) return null;
-  if (uuidBytes.length === 16 && !msg.subarray(1, 17).equals(uuidBytes)) return null;
-  let i = 17;
-  const optLen = msg[i]; i += 1 + optLen;
-  if (msg[i] !== 1) return null; // TCP only
-  i += 1;
-  const port = msg.readUInt16BE(i); i += 2;
-  const atyp = msg[i]; i += 1;
-  let host;
-  if (atyp === 1) { host = [...msg.subarray(i, i + 4)].join('.'); i += 4; }
-  else if (atyp === 2) { const l = msg[i]; i += 1; host = msg.subarray(i, i + l).toString(); i += l; }
-  else if (atyp === 3) {
-    const parts = [];
-    for (let k = 0; k < 8; k++) { parts.push(msg.readUInt16BE(i).toString(16)); i += 2; }
-    host = parts.join(':');
-  } else return null;
-  return { host, port, offset: i };
-}
+main().catch((e) => { console.error('[nezha] fatal:', e.message); process.exit(1); });
 
-const server = http.createServer((req, res) => {
+// Keep HTTP port open so the platform health check passes
+require('http').createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('ok');
-});
-
-server.on('upgrade', (req, socket, head) => {
-  const url = new URL(req.url, 'http://localhost');
-  if (url.pathname !== WS_PATH) { socket.destroy(); return; }
-  const key = req.headers['sec-websocket-key'];
-  if (!key) { socket.destroy(); return; }
-  socket.write(
-    'HTTP/1.1 101 Switching Protocols\r\n' +
-    'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
-    `Sec-WebSocket-Accept: ${wsAccept(key)}\r\n\r\n`);
-  if (head && head.length) socket.unshift(head);
-
-  let upstream = null;
-  let first = true;
-  const parser = new FrameParser((msg) => {
-    if (first) {
-      first = false;
-      const target = parseVlessHeader(msg);
-      if (!target) { socket.destroy(); return; }
-      upstream = net.connect(target.port, target.host, () => {
-        socket.write(encodeFrame(Buffer.from([0, 0])));
-        const rest = msg.subarray(target.offset);
-        if (rest.length) upstream.write(rest);
-      });
-      upstream.on('data', (d) => { try { socket.write(encodeFrame(d)); } catch {} });
-      upstream.on('error', () => { try { socket.destroy(); } catch {} });
-      upstream.on('close', () => { try { socket.destroy(); } catch {} });
-    } else if (upstream) {
-      upstream.write(msg);
-    }
-  }, (payload) => {
-    // pong: FIN + opcode 0xA
-    const frame = Buffer.concat([Buffer.from([0x8a, payload.length]), payload]);
-    try { socket.write(frame); } catch {}
-  }, () => { try { upstream && upstream.destroy(); } catch {} });
-
-  socket.on('data', (chunk) => { try { parser.push(chunk); } catch { socket.destroy(); } });
-  socket.on('error', () => { try { upstream && upstream.destroy(); } catch {} });
-  socket.on('close', () => { try { upstream && upstream.destroy(); } catch {} });
-});
-
-require('https').get('https://ipinfo.io/json', (res) => {
-  let b = '';
-  res.on('data', (c) => (b += c));
-  res.on('end', () => console.log('egress:', b.slice(0, 300)));
-}).on('error', (e) => console.log('egress check failed:', e.message));
-server.listen(PORT, () => console.log(`vless-ws listening on :${PORT} path=${WS_PATH}`));
+}).listen(parseInt(process.env.PORT || '8080', 10));
